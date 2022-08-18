@@ -190,7 +190,8 @@ class MqttClient : public nodelet::Nodelet,
    *
    * @param   mqtt_msg     MQTT message
    */
-  void mqtt2ros(mqtt::const_message_ptr mqtt_msg);
+  void mqtt2ros(mqtt::const_message_ptr mqtt_msg,
+                const ros::WallTime& t_in = ros::WallTime(0));
 
   /**
    * @brief Callback for when the client has successfully connected to the
@@ -322,7 +323,10 @@ class MqttClient : public nodelet::Nodelet,
     struct {
       ros::Subscriber subscriber;  ///< generic ROS subscriber
       int queue_size = 1;          ///< ROS subscriber queue size
-    } ros;                         ///< ROS-related variables
+      std::string timestamp_topic_prefix;
+      ros::Publisher timestamp_in_publisher;
+      ros::Publisher timestamp_out_publisher;
+    } ros;  ///< ROS-related variables
     struct {
       std::string topic;      ///< MQTT topic
       int qos = 0;            ///< MQTT QoS value
@@ -345,7 +349,10 @@ class MqttClient : public nodelet::Nodelet,
       ros::Publisher latency_publisher;         ///< ROS publisher for latency
       int queue_size = 1;                       ///< ROS publisher queue size
       bool latched = false;  ///< whether to latch ROS message
-    } ros;                   ///< ROS-related variables
+      std::string timestamp_topic_prefix;
+      ros::Publisher timestamp_in_publisher;
+      ros::Publisher timestamp_out_publisher;
+    } ros;  ///< ROS-related variables
   };
 
  protected:

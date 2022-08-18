@@ -63,6 +63,7 @@
   <depend>topic_tools</depend>
   <exec_depend>message_runtime</exec_depend>
 
+  <depend>benchmarking_suite</depend>
 
   <!-- The export tag contains other, unspecified, tags -->
   <export>

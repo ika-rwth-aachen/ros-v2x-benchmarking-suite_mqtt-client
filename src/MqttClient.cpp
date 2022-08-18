@@ -29,6 +29,7 @@ SOFTWARE.
 #include <cstring>
 #include <vector>
 
+#include <benchmarking_suite/TimeStamped.h>
 #include <mqtt_client/MqttClient.h>
 #include <mqtt_client/RosMsgType.h>
 #include <pluginlib/class_list_macros.h>
@@ -47,6 +48,29 @@ const std::string MqttClient::kRosMsgTypeMqttTopicPrefix =
   "mqtt_client/ros_msg_type/";
 
 const std::string MqttClient::kLatencyRosTopicPrefix = "latencies/";
+
+
+benchmarking_suite::TimeStamped createTimestamp(
+  const ros::WallTime& time, const std::vector<uint8_t>& msg_buffer) {
+
+  // reinterpret buffer as uint32
+  const uint32_t* msg_buffer32 =
+    reinterpret_cast<const uint32_t*>(msg_buffer.data());
+
+  // extract message header from buffer
+  std_msgs::Header header;
+  header.seq = msg_buffer32[0];
+  header.stamp.sec = msg_buffer32[1];
+  header.stamp.nsec = msg_buffer32[2];
+
+  // create timestamp
+  benchmarking_suite::TimeStamped ts;
+  ts.header = header;
+  ts.time.sec = time.sec;
+  ts.time.nsec = time.nsec;
+
+  return ts;
+}
 
 
 void MqttClient::onInit() {
@@ -137,6 +161,11 @@ void MqttClient::loadParameters() {
           if (ros2mqtt_params[k].hasMember("inject_timestamp"))
             ros2mqtt.stamped = ros2mqtt_params[k]["inject_timestamp"];
 
+          // ros2mqtt[k]/timestamp_topic_prefix
+          if (ros2mqtt_params[k].hasMember("timestamp_topic_prefix"))
+            ros2mqtt.ros.timestamp_topic_prefix =
+              std::string(ros2mqtt_params[k]["timestamp_topic_prefix"]);
+
           // ros2mqtt[k]/advanced
           if (ros2mqtt_params[k].hasMember("advanced")) {
             XmlRpc::XmlRpcValue& advanced_params =
@@ -179,6 +208,11 @@ void MqttClient::loadParameters() {
           std::string& mqtt_topic = mqtt2ros_params[k]["mqtt_topic"];
           Mqtt2RosInterface& mqtt2ros = mqtt2ros_[mqtt_topic];
           mqtt2ros.ros.topic = std::string(mqtt2ros_params[k]["ros_topic"]);
+
+          // mqtt2ros[k]/timestamp_topic_prefix
+          if (mqtt2ros_params[k].hasMember("timestamp_topic_prefix"))
+            mqtt2ros.ros.timestamp_topic_prefix =
+              std::string(mqtt2ros_params[k]["timestamp_topic_prefix"]);
 
           // mqtt2ros[k]/advanced
           if (mqtt2ros_params[k].hasMember("advanced")) {
@@ -274,6 +308,28 @@ void MqttClient::setup() {
   is_connected_service_ = private_node_handle_.advertiseService(
     "is_connected", &MqttClient::isConnectedService, this);
 
+  // create ROS timestamp publishers
+  for (auto& ros2mqtt_p : ros2mqtt_) {
+    Ros2MqttInterface& ros2mqtt = ros2mqtt_p.second;
+    const std::string& topic = ros2mqtt.ros.timestamp_topic_prefix;
+    if (topic.empty()) continue;
+    using namespace benchmarking_suite;
+    ros2mqtt.ros.timestamp_in_publisher =
+      private_node_handle_.advertise<TimeStamped>(topic + "/in", 10);
+    ros2mqtt.ros.timestamp_out_publisher =
+      private_node_handle_.advertise<TimeStamped>(topic + "/out", 10);
+  }
+  for (auto& mqtt2ros_p : mqtt2ros_) {
+    Mqtt2RosInterface& mqtt2ros = mqtt2ros_p.second;
+    const std::string& topic = mqtt2ros.ros.timestamp_topic_prefix;
+    if (topic.empty()) continue;
+    using namespace benchmarking_suite;
+    mqtt2ros.ros.timestamp_in_publisher =
+      private_node_handle_.advertise<TimeStamped>(topic + "/in", 10);
+    mqtt2ros.ros.timestamp_out_publisher =
+      private_node_handle_.advertise<TimeStamped>(topic + "/out", 10);
+  }
+
   // create ROS subscribers
   for (auto& ros2mqtt_p : ros2mqtt_) {
     const std::string& ros_topic = ros2mqtt_p.first;
@@ -368,6 +424,8 @@ void MqttClient::connect() {
 void MqttClient::ros2mqtt(const topic_tools::ShapeShifter::ConstPtr& ros_msg,
                           const std::string& ros_topic) {
 
+  ros::WallTime t_in = ros::WallTime::now();
+
   Ros2MqttInterface& ros2mqtt = ros2mqtt_[ros_topic];
 
   // gather information on ROS message type in special ROS message
@@ -459,16 +517,27 @@ void MqttClient::ros2mqtt(const topic_tools::ShapeShifter::ConstPtr& ros_msg,
     mqtt::message_ptr mqtt_msg =
       mqtt::make_message(mqtt_topic, payload_buffer.data(), payload_length,
                          ros2mqtt.mqtt.qos, ros2mqtt.mqtt.retained);
-    client_->publish(mqtt_msg);
+    client_->publish(mqtt_msg)->wait();
   } catch (const mqtt::exception& e) {
     NODELET_WARN(
       "Publishing ROS message type information to MQTT topic '%s' failed: %s",
       mqtt_topic.c_str(), e.what());
   }
+
+  // publish timestamps
+  ros::WallTime t_out = ros::WallTime::now();
+  if (!ros2mqtt.ros.timestamp_topic_prefix.empty()) {
+    using namespace benchmarking_suite;
+    TimeStamped ts_in = createTimestamp(t_in, msg_buffer);
+    TimeStamped ts_out = createTimestamp(t_out, msg_buffer);
+    ros2mqtt.ros.timestamp_in_publisher.publish(ts_in);
+    ros2mqtt.ros.timestamp_out_publisher.publish(ts_out);
+  }
 }
 
 
-void MqttClient::mqtt2ros(mqtt::const_message_ptr mqtt_msg) {
+void MqttClient::mqtt2ros(mqtt::const_message_ptr mqtt_msg,
+                          const ros::WallTime& t_in) {
 
   std::string mqtt_topic = mqtt_msg->get_topic();
   Mqtt2RosInterface& mqtt2ros = mqtt2ros_[mqtt_topic];
@@ -534,6 +603,16 @@ void MqttClient::mqtt2ros(mqtt::const_message_ptr mqtt_msg) {
   ros::serialization::OStream msg_stream(msg_buffer.data(), msg_length);
   mqtt2ros.ros.shape_shifter.read(msg_stream);
   mqtt2ros.ros.publisher.publish(mqtt2ros.ros.shape_shifter);
+
+  // publish timestamps
+  ros::WallTime t_out = ros::WallTime::now();
+  if (!mqtt2ros.ros.timestamp_topic_prefix.empty()) {
+    using namespace benchmarking_suite;
+    TimeStamped ts_in = createTimestamp(t_in, msg_buffer);
+    TimeStamped ts_out = createTimestamp(t_out, msg_buffer);
+    mqtt2ros.ros.timestamp_in_publisher.publish(ts_in);
+    mqtt2ros.ros.timestamp_out_publisher.publish(ts_out);
+  }
 }
 
 
@@ -580,6 +659,8 @@ bool MqttClient::isConnectedService(IsConnected::Request& request,
 
 
 void MqttClient::message_arrived(mqtt::const_message_ptr mqtt_msg) {
+
+  ros::WallTime t_in = ros::WallTime::now();
 
   std::string mqtt_topic = mqtt_msg->get_topic();
   NODELET_DEBUG("Received MQTT message on topic '%s'", mqtt_topic.c_str());
@@ -632,7 +713,7 @@ void MqttClient::message_arrived(mqtt::const_message_ptr mqtt_msg) {
 
     // publish ROS message, if publisher initialized
     if (!mqtt2ros_[mqtt_topic].ros.publisher.getTopic().empty()) {
-      mqtt2ros(mqtt_msg);
+      mqtt2ros(mqtt_msg, t_in);
     } else {
       NODELET_WARN(
         "ROS publisher for data from MQTT topic '%s' is not yet initialized: "
